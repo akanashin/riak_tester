@@ -8,39 +8,75 @@
 #include <chrono>
 
 
-template <class T>
+template <typename T>
+struct strategy_drop_last;
+template <typename T>
+struct strategy_drop_first;
+
+template <class T, class S = strategy_drop_last<T> >
 class queue
 {
 public:
-    void enqueue(const T & cdata);
+    queue(int max_length = -1): m_max_length(max_length) {}
+
+    // returns true is success, false if element was not enqueued
+    bool enqueue(const T & cdata);
+
     void dequeue(T & cdata);
     bool dequeue(T & cdata, const int timeout_ms);
     void clear();
+    
 private:
     std::deque<T> m_queue;
     std::mutex m_mutex;
     std::condition_variable m_cond_var;
+    int m_max_length;
 };
 
+template <typename T>
+struct strategy_drop_last {
+    static bool fix(queue<T, strategy_drop_last<T> >*, T const&) { return false; };
+};
+template <typename T>
+struct strategy_drop_first {
+    static bool fix(queue<T, strategy_drop_first<T> >* q, T const& t) {
+        T tmp;
+        q->dequeue(tmp);
+        q->enqueue(t);
 
-template <class T>
-void queue<T>::enqueue(const T & cdata)
+        return true;
+    };
+};
+
+// returns false is queue is already full
+//         true is cdata was put into queue
+template <typename T, typename S>
+bool queue<T, S>::enqueue(const T & cdata)
 {
     bool was_empty;
+    bool result = true;
     
     {
         // The m_mutex must be unlocked when we call notify_one().
         std::lock_guard<std::mutex> lock(m_mutex);
         was_empty = m_queue.empty();
-        m_queue.push_back(cdata);
+
+        // check if queue is full
+        if (m_max_length != -1 && m_queue.size() >= m_max_length)
+        {
+            result = S::fix(this, cdata);
+        } else
+            m_queue.push_back(cdata);
     }
     
     if (was_empty)
         m_cond_var.notify_one();
+
+    return result;
 }
 
-template <class T>
-void queue<T>::dequeue(T & cdata)
+template <typename T, typename S>
+void queue<T, S>::dequeue(T & cdata)
 {
     std::unique_lock<std::mutex> lock(m_mutex);
     m_cond_var.wait(lock, [this] { return !m_queue.empty(); });
@@ -48,8 +84,8 @@ void queue<T>::dequeue(T & cdata)
     m_queue.pop_front();
 }
 
-template <class T>
-bool queue<T>::dequeue(T & cdata, const int timeout_ms)
+template <typename T, typename S>
+bool queue<T, S>::dequeue(T & cdata, const int timeout_ms)
 {
     std::unique_lock<std::mutex> lock(m_mutex);
     
@@ -71,8 +107,8 @@ bool queue<T>::dequeue(T & cdata, const int timeout_ms)
     return true;
 }
 
-template <class T>
-void queue<T>::clear()
+template <typename T, typename S>
+void queue<T, S>::clear()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_queue.clear();

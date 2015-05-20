@@ -36,7 +36,7 @@ struct command_t {
 };
 
 struct executor_t::impl_t {
-    queue<command_t>     m_queue;
+    queue<command_t, strategy_drop_first<command_t> >     m_queue;
     strvector            m_addrs;
 
     size_t               m_cmd_executor_thr_id;
@@ -94,7 +94,7 @@ executor_t::executor_t(strvector const& addrlist)
     m_impl->m_cur_mode.store(impl_t::mode_e::RUN);
     m_impl->m_stoping.store(false);
 
-    for(std::string addr : addrlist)
+    for(std::string const& addr : addrlist)
     {
         std::string host;
         int port;
@@ -245,7 +245,21 @@ void executor_t::impl_t::cmd_processor()
     try
     {       
         while ( m_cur_mode.load() != mode_e::STOP_NOW )
-        {       
+        {
+            // waiting for alive Riak clients
+            if (m_riaks.empty()) {
+                LOG_D << "no Riak clients!" << endl;
+
+                // trying to get alive Riak client from Reconnector thread
+                riak_iface_ptr p;
+                if ( m_from_reconnect.dequeue(p, 1000) )
+                    m_riaks.push_back(p);
+                    
+                continue;
+            }
+            
+            
+            // processign next command
             command_t cmd;
 
             // check if we need to stop right now/if there is no data
@@ -262,20 +276,6 @@ void executor_t::impl_t::cmd_processor()
             // check if we need to stop in any case
             if (m_cur_mode.load() == mode_e::STOP_NOW)
                 break;
-
-            // process the command
-            // first: check if we have Riak clients ready to work
-            // Nb: it's not very possible to have this situation but protection should be there anyway
-            if (m_riaks.empty()) {
-                LOG_D << "no Riak clients!" << endl;
-
-                // return current command back to queue
-                m_queue.enqueue(cmd);
-
-                // have little pause before repeat
-                sleep(1);            
-                continue;
-            }
 
             // always use the first Riak client
             riak_iface_ptr p = m_riaks.front();
@@ -300,47 +300,20 @@ void executor_t::impl_t::cmd_processor()
             // verify result
             if (p->is_error_code(result))
             {
-                LOG_D << "Reconnecting client (result code=" << result << ")" << endl;
+                LOG_D << "Send client to reconnect (result code=" << result << ")" << endl;
 
                 // reconnect current client
                 //  (send it to reconnector thread)
                 m_to_reconnect.enqueue(p);
                 m_riaks.erase(m_riaks.begin());
 
-                // if there are no alive clients
-                //  sit here and wait
-                if (m_riaks.empty())
-                {
-                    LOG_D << "  waiting for clients" << endl;
-                
-                    riak_iface_ptr p;
-                    while( m_cur_mode.load() != mode_e::STOP_NOW
-                           && !m_from_reconnect.dequeue(p, 1000) );
-
-                    // here we in 2 cases:
-                    //  it's time to stop anyway
-                    // or
-                    //  some of Riak clients reconnected successfully
-                    if (m_cur_mode.load() == mode_e::STOP_NOW)
-                        break;
-
-                    LOG_D << "  fetching reconnected clients" << endl;
-
-                    // put already fetched client into list
-                    m_riaks.push_back(p);
-
-                    // read all the Riak clients from reconnected queue
-                    while ( m_from_reconnect.dequeue(p, 1) )
-                        m_riaks.push_back(p);
-
-                    LOG_D << "  done!" << endl;
-                }
-            
                 // put command back to queue to repeat executing later
                 m_queue.enqueue(cmd);
+                
                 continue;
             }
 
+            // command executed successfully
             // return result of --successfull-- GET operation
             if (cmd.type == command_t::op_e::GET)
                 try {
